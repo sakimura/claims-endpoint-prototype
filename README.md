@@ -20,7 +20,11 @@ its binding in trusted in-process memory. The RP function verifies the
 enclosing OP JWT and the embedded CP JWT before reading the attribute.
 
 The tests cover successful acquisition and delivery, empty results, cached
-disclosure without CP contact, and rejection of a different CP subject.
+disclosure without CP contact, and rejection of a different CP subject. They
+also cover malformed JSON and acquisition envelopes, expired and completed
+operations, invalid or substituted JWTs, and attributes outside the request
+or collection authorization. Rejected acquisitions preserve the existing
+account binding and exact stored JWT.
 The fixture supplies authorization and preconfigured issuer keys. Setup,
 OAuth token issuance, discovery, persistent storage, and independent
 implementations are tracked in [Issue #55](https://github.com/openid/claims-aggregation/issues/55).

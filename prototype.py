@@ -42,6 +42,18 @@ def parse_object(data):
     return value
 
 
+def parse_response_object(data):
+    class ObjectPairs(list):
+        pass
+
+    pairs = json.loads(data, object_pairs_hook=ObjectPairs)
+    if not isinstance(pairs, ObjectPairs):
+        raise ValueError("expected JSON object")
+    # Only the envelope's member names are checked. Known envelope values must
+    # be strings. Unknown values are ignored, including any nested objects.
+    return object_members(pairs)
+
+
 def json_bytes(value):
     return json.dumps(value, separators=(",", ":")).encode("utf-8")
 
@@ -187,6 +199,7 @@ class Binding:
 class Collection:
     binding: Binding
     claims: frozenset
+    authorized_claims: frozenset
     deadline: float
 
 
@@ -198,12 +211,14 @@ class StoredClaimSet:
 
 
 class AggregatingOP:
-    def __init__(self, endpoint, tls_context, cp_key, op_key, bindings, disclosures):
+    def __init__(self, endpoint, tls_context, cp_key, op_key, bindings,
+                 collection_permissions, disclosures):
         self.endpoint = endpoint
         self.tls_context = tls_context
         self.cp_key = cp_key
         self.op_key = op_key
         self.bindings = bindings
+        self.collection_permissions = collection_permissions
         self.disclosures = disclosures
         self.pending = {}
         self.records = {}
@@ -215,7 +230,11 @@ class AggregatingOP:
         nonce = secrets.token_urlsafe(16)
         while nonce in self.pending:
             nonce = secrets.token_urlsafe(16)
-        self.pending[nonce] = Collection(binding, frozenset(names), time.monotonic() + 5)
+        self.pending[nonce] = Collection(
+            binding, frozenset(names),
+            frozenset(self.collection_permissions.get(binding, ())),
+            time.monotonic() + 5,
+        )
         request = Request(self.endpoint, data=json_bytes({
             "claims": dict.fromkeys(names), "nonce": nonce, "signing_alg": ALGORITHM,
         }), headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
@@ -224,7 +243,7 @@ class AggregatingOP:
                 if (reply.status != 200 or reply.headers.get_content_type() != "application/json"
                         or reply.headers.get("Cache-Control") != NO_STORE):
                     raise ValueError("invalid Claims Endpoint response")
-                envelope = parse_object(reply.read())
+                envelope = parse_response_object(reply.read())
             return self.accept(nonce, envelope)
         finally:
             self.pending.pop(nonce, None)
@@ -246,6 +265,8 @@ class AggregatingOP:
         attributes = verify_claim_set(jwt, self.cp_key)
         if not attributes or not attributes.keys() <= operation.claims:
             raise ValueError("unexpected attributes")
+        if not attributes.keys() <= operation.authorized_claims:
+            raise ValueError("unauthorized attributes")
         record = StoredClaimSet(operation.binding, jwt, time.time())
         self.records[operation.binding] = record
         return record
