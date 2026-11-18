@@ -12,6 +12,41 @@ certificate. Each run exercises real RS256 signing and verification.
 python3 -B test_prototype.py
 ```
 
+## Reproducible RS256 vectors
+
+The [vector file](vectors/rs256.json) contains standalone CP Claim Sets, OP-signed
+presentations embedding those exact Claim Sets, and the expected result for
+both verifiers. The four PEM files in `vectors/` are a dedicated CP and OP test
+key pair. **Both private keys are intentionally public and are for tests only.**
+
+Use Python 3.9+ and OpenSSL on PATH. The verifier regenerates the vectors
+byte for byte, compares them with the checked-in file, and checks the OP's
+Claim Set verifier and the RP's full signed presentation verifier at
+`2030-01-01T00:00:00Z` (`1893456000`). No HTTPS server is needed for this check.
+
+```sh
+python3 -B verify_vectors.py
+```
+
+To regenerate the checked-in JSON using the same fixture keys:
+
+```sh
+python3 -B verify_vectors.py --write
+git diff --exit-code -- vectors/rs256.json
+```
+
+| Vector | Expected at the OP and RP |
+| --- | --- |
+| Valid | Accept and return `birthdate` |
+| Wrong issuer | Reject the CP issuer |
+| Wrong audience | Reject the CP audience |
+| ID Token type | Reject a CP-signed JWT without the Claim Set type |
+| Wrong signing key | Reject a Claim Set signed with the OP key |
+| Expired | Reject at the JWT's exact expiry time |
+| Forbidden `sub` | Reject a Claim Set containing a CP subject identifier |
+
+## HTTPS prototype tests
+
 The CP maps fixture bearer tokens to CP subjects and permitted attributes.
 The OP starts with a fixture for the binding that Setup would establish.
 It obtains the CP response over HTTPS, checks the pending operation and
