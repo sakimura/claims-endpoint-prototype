@@ -25,6 +25,11 @@ also cover malformed JSON and acquisition envelopes, expired and completed
 operations, invalid or substituted JWTs, and attributes outside the request
 or collection authorization. Rejected acquisitions preserve the existing
 account binding and exact stored JWT.
+
+The CP distinguishes bearer token and scope errors from a successful empty
+result. The partial-result tests check the actual embedded JWT for attributes
+outside the request or grant and exercise the RP's local required-claim policy.
+
 The fixture supplies authorization and preconfigured issuer keys. Setup,
 OAuth token issuance, discovery, persistent storage, and independent
 implementations are tracked in [Issue #55](https://github.com/openid/claims-aggregation/issues/55).

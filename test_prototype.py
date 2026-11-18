@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 from prototype import (
     AggregatingOP, Binding, CLAIM_SET_TYPE, CP, ClaimsEndpoint, Collection,
     KeyPair, OP, RP, b64, json_bytes, make_server, openssl, parse_object,
-    receive, sign, timestamps, verify,
+    receive, sign, timestamps, verify, verify_claim_set,
 )
 
 
@@ -61,6 +61,48 @@ class CollectionTests(unittest.TestCase):
         record = self.op.collect("op-alice", "fixture-alice", ["birthdate"])
         self.assertIsNone(self.op.collect("op-alice", "fixture-alice", ["address"]))
         self.assertIs(self.op.records[self.alice], record)
+
+    def test_bearer_token_and_scope_errors_are_distinct_from_empty_success(self):
+        record = self.op.collect("op-alice", "fixture-alice", ["birthdate"])
+        cases = (
+            ("fixture-invalid", 401, "invalid_token"),
+            ("fixture-alice-no-claims-scope", 403, "insufficient_scope"),
+        )
+        for token, status, error in cases:
+            with self.subTest(error=error):
+                with self.assertRaises(HTTPError) as rejected:
+                    self.op.collect("op-alice", token, ["birthdate"])
+                with rejected.exception as response:
+                    self.assertEqual(response.code, status)
+                    self.assertEqual(response.headers["WWW-Authenticate"], f'Bearer error="{error}"')
+                    self.assertEqual(parse_object(response.read()), {"error": error})
+                self.assert_previous_state(record)
+
+        self.assertIsNone(self.op.collect("op-alice", "fixture-alice", ["address"]))
+        self.assert_previous_state(record)
+
+    def test_partial_result_delivers_only_requested_and_authorized_attributes(self):
+        record = self.op.collect("op-alice", "fixture-alice", ["birthdate", "address"])
+        presentation = self.deliver_to_rp()
+        self.assertEqual(presentation["_claim_names"], {"birthdate": "cp1"})
+        embedded = presentation["_claim_sources"]["cp1"]["JWT"]
+        self.assertEqual(embedded, record.jwt)
+        self.assertEqual(verify_claim_set(embedded, self.cp_key.public), {
+            "birthdate": "1990-01-01",
+        })
+
+    def test_rp_does_not_complete_when_required_attribute_is_missing(self):
+        self.op.collect("op-alice", "fixture-alice", ["birthdate", "address"])
+        presentation = self.op.deliver("op-alice", RP)
+
+        self.assertEqual(
+            receive(presentation, self.op_key.public, self.cp_key.public, "op-alice",
+                    required_claims={"birthdate"}),
+            {"birthdate": "1990-01-01"},
+        )
+        with self.assertRaisesRegex(ValueError, "required claims unavailable"):
+            receive(presentation, self.op_key.public, self.cp_key.public, "op-alice",
+                    required_claims={"birthdate", "address"})
 
     def test_redisclosure_preserves_exact_jwt_without_cp_contact(self):
         record = self.op.collect("op-alice", "fixture-alice", ["birthdate"])

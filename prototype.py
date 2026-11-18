@@ -20,9 +20,23 @@ CLAIM_SET_TYPE = "claims-aggregation+jwt"
 ALGORITHM = "RS256"
 NO_STORE = "no-store"
 PROTOCOL_CLAIMS = {"iss", "sub", "aud", "iat", "exp", "nbf", "jti"}
+
+
+@dataclass(frozen=True)
+class Grant:
+    subject: str
+    attributes: dict
+    claims_endpoint_allowed: bool = True
+
+
 GRANTS = {
-    "fixture-alice": ("cp-alice", {"birthdate": "1990-01-01"}),
-    "fixture-bob": ("cp-bob", {"birthdate": "1991-02-03"}),
+    "fixture-alice": Grant("cp-alice", {
+        "birthdate": "1990-01-01", "given_name": "Alice",
+    }),
+    "fixture-bob": Grant("cp-bob", {"birthdate": "1991-02-03"}),
+    "fixture-alice-no-claims-scope": Grant(
+        "cp-alice", {"birthdate": "1990-01-01"}, claims_endpoint_allowed=False,
+    ),
 }
 
 
@@ -159,6 +173,9 @@ class ClaimsEndpoint(BaseHTTPRequestHandler):
         if grant is None:
             self.respond(401, {"error": "invalid_token"}, 'Bearer error="invalid_token"')
             return
+        if not grant.claims_endpoint_allowed:
+            self.respond(403, {"error": "insufficient_scope"}, 'Bearer error="insufficient_scope"')
+            return
         try:
             size = int(self.headers.get("Content-Length", "0"))
             if not 0 < size <= 4096 or self.headers.get_content_type() != "application/json":
@@ -177,14 +194,13 @@ class ClaimsEndpoint(BaseHTTPRequestHandler):
         except ValueError:
             self.respond(400, {"error": "invalid_request"})
             return
-        account_ref, allowed = grant
-        attributes = {name: allowed[name] for name in selection if name in allowed}
+        attributes = {name: grant.attributes[name] for name in selection if name in grant.attributes}
         response = {"nonce": nonce}
         if attributes:
             jwt = sign(self.server.signing_key, CLAIM_SET_TYPE, {
                 "iss": CP, "aud": OP, **timestamps(), **attributes,
             })
-            response.update(account_ref=account_ref, claim_set=jwt)
+            response.update(account_ref=grant.subject, claim_set=jwt)
         self.respond(200, response)
 
 
@@ -286,7 +302,7 @@ class AggregatingOP:
         })
 
 
-def receive(enclosing, op_key, cp_key, expected_account):
+def receive(enclosing, op_key, cp_key, expected_account, *, required_claims=()):
     response = verify(enclosing, op_key, "JWT", OP, RP)
     if response.get("sub") != expected_account:
         raise ValueError("unexpected OP subject")
@@ -294,7 +310,10 @@ def receive(enclosing, op_key, cp_key, expected_account):
     verified = {
         name: verify_claim_set(source["JWT"], cp_key) for name, source in sources.items()
     }
-    return {name: verified[source][name] for name, source in response["_claim_names"].items()}
+    attributes = {name: verified[source][name] for name, source in response["_claim_names"].items()}
+    if set(required_claims).difference(attributes):
+        raise ValueError("required claims unavailable")
+    return attributes
 
 
 def make_server(directory, signing_key):
