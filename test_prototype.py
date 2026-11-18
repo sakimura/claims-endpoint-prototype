@@ -1,4 +1,5 @@
 from pathlib import Path
+import secrets
 from tempfile import TemporaryDirectory
 from threading import Thread
 import time
@@ -8,7 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from prototype import (
-    AggregatingOP, Binding, CLAIM_SET_TYPE, CP, ClaimsEndpoint, Collection,
+    AggregatingOP, Binding, CLAIM_SET_TYPE, CP, ClaimsEndpoint, ClaimStore, Collection,
     KeyPair, OP, RP, b64, json_bytes, make_server, openssl, parse_object,
     receive, sign, timestamps, verify, verify_claim_set,
 )
@@ -30,22 +31,36 @@ class CollectionTests(unittest.TestCase):
         cls.addClassCleanup(cls.server.shutdown)
 
     def setUp(self):
+        workspace = TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        self.directory = Path(workspace.name)
+        self.store_path = self.directory / "active.sqlite"
+        self.integrity_key = secrets.token_bytes(32)
+        self.store = ClaimStore(self.store_path, self.integrity_key)
+        self.addCleanup(self.store.close)
         self.alice = Binding("op-alice", CP, "cp-alice")
         self.op = AggregatingOP(
             f"https://127.0.0.1:{self.server.server_port}/claims",
-            self.tls, self.cp_key.public, self.op_key.private,
+            self.tls, (self.cp_key.public,), self.op_key.private,
             {"op-alice": self.alice},
             {self.alice: {"birthdate"}},
             {(self.alice, RP): {"birthdate"}},
+            self.store,
         )
+
+    def reopen_store(self):
+        self.store.close()
+        self.store = ClaimStore(self.store_path, self.integrity_key)
+        self.addCleanup(self.store.close)
+        self.op.store = self.store
 
     def deliver_to_rp(self):
         presentation = self.op.deliver("op-alice", RP)
         self.assertEqual(
-            receive(presentation, self.op_key.public, self.cp_key.public, "op-alice"),
+            receive(presentation, self.op_key.public, (self.cp_key.public,), "op-alice"),
             {"birthdate": "1990-01-01"},
         )
-        return verify(presentation, self.op_key.public, "JWT", OP, RP)
+        return verify(presentation, (self.op_key.public,), "JWT", OP, RP)
 
     def test_successful_collection_and_delivery(self):
         record = self.op.collect("op-alice", "fixture-alice", ["birthdate"])
@@ -57,10 +72,10 @@ class CollectionTests(unittest.TestCase):
 
     def test_empty_result_creates_no_record_and_preserves_cached_jwt(self):
         self.assertIsNone(self.op.collect("op-alice", "fixture-alice", ["address"]))
-        self.assertEqual(self.op.records, {})
+        self.assertIsNone(self.store.load(self.alice))
         record = self.op.collect("op-alice", "fixture-alice", ["birthdate"])
         self.assertIsNone(self.op.collect("op-alice", "fixture-alice", ["address"]))
-        self.assertIs(self.op.records[self.alice], record)
+        self.assertEqual(self.store.load(self.alice), record)
 
     def test_bearer_token_and_scope_errors_are_distinct_from_empty_success(self):
         record = self.op.collect("op-alice", "fixture-alice", ["birthdate"])
@@ -87,7 +102,7 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(presentation["_claim_names"], {"birthdate": "cp1"})
         embedded = presentation["_claim_sources"]["cp1"]["JWT"]
         self.assertEqual(embedded, record.jwt)
-        self.assertEqual(verify_claim_set(embedded, self.cp_key.public), {
+        self.assertEqual(verify_claim_set(embedded, (self.cp_key.public,)), {
             "birthdate": "1990-01-01",
         })
 
@@ -96,12 +111,12 @@ class CollectionTests(unittest.TestCase):
         presentation = self.op.deliver("op-alice", RP)
 
         self.assertEqual(
-            receive(presentation, self.op_key.public, self.cp_key.public, "op-alice",
+            receive(presentation, self.op_key.public, (self.cp_key.public,), "op-alice",
                     required_claims={"birthdate"}),
             {"birthdate": "1990-01-01"},
         )
         with self.assertRaisesRegex(ValueError, "required claims unavailable"):
-            receive(presentation, self.op_key.public, self.cp_key.public, "op-alice",
+            receive(presentation, self.op_key.public, (self.cp_key.public,), "op-alice",
                     required_claims={"birthdate", "address"})
 
     def test_redisclosure_preserves_exact_jwt_without_cp_contact(self):
@@ -118,17 +133,130 @@ class CollectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CP account binding mismatch"):
             self.op.collect("op-alice", "fixture-bob", ["birthdate"])
         self.assertEqual(self.op.bindings["op-alice"], self.alice)
-        self.assertIs(self.op.records[self.alice], record)
+        self.assertEqual(self.store.load(self.alice), record)
         self.assertEqual(self.op.pending, {})
         self.deliver_to_rp()
 
     def assert_previous_state(self, record):
         self.assertEqual(self.op.bindings, {"op-alice": self.alice})
-        self.assertEqual(set(self.op.records), {self.alice})
-        self.assertIs(self.op.records[self.alice], record)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM records").fetchone(), (1,))
+        self.assertEqual(self.store.load(self.alice), record)
         self.assertEqual(self.op.pending, {})
         result = self.deliver_to_rp()
         self.assertEqual(result["_claim_sources"]["cp1"]["JWT"], record.jwt)
+
+    def test_persistent_record_rejects_substitution_across_account_bindings(self):
+        alice = self.op.collect("op-alice", "fixture-alice", ["birthdate"])
+        bob_binding = Binding("op-bob", CP, "cp-bob")
+        self.op.bindings["op-bob"] = bob_binding
+        self.op.collection_permissions[bob_binding] = {"birthdate"}
+        bob = self.op.collect("op-bob", "fixture-bob", ["birthdate"])
+        self.reopen_store()
+        self.assertEqual(self.store.load(self.alice), alice)
+        self.assertEqual(self.deliver_to_rp()["_claim_sources"]["cp1"]["JWT"], alice.jwt)
+        self.assertEqual(verify_claim_set(bob.jwt, (self.cp_key.public,)),
+                         {"birthdate": "1991-02-03"})
+
+        # Copy Bob's valid JWT and integrity tag into the row indexed by Alice.
+        with self.store.db:
+            self.store.db.execute(
+                """INSERT OR REPLACE INTO records
+                   SELECT ?, jwt, collected_at, tag FROM records WHERE binding = ?""",
+                (self.store.binding_key(self.alice), self.store.binding_key(bob_binding)),
+            )
+        with self.assertRaisesRegex(ValueError, "binding or integrity mismatch"):
+            self.op.deliver("op-alice", RP)
+        self.assertEqual(self.store.load(bob_binding), bob)
+
+    def test_restore_of_older_backup_does_not_reactivate_deleted_claim_set(self):
+        self.op.collect("op-alice", "fixture-alice", ["birthdate"])
+        backup = self.directory / "before-deletion.sqlite"
+        self.store.backup(backup)
+        self.store.delete(self.alice)
+        self.reopen_store()
+        self.store.restore(backup)
+
+        self.assertIsNone(self.store.load(self.alice))
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM records").fetchone(), (0,))
+        with self.assertRaisesRegex(ValueError, "no stored Claim Set"):
+            self.op.deliver("op-alice", RP)
+
+    def test_restore_preserves_collection_and_rp_specific_withdrawals(self):
+        record = self.op.collect("op-alice", "fixture-alice", ["birthdate"])
+        other_rp = "rp-other"
+        self.op.disclosures[self.alice, other_rp] = {"birthdate"}
+        backup = self.directory / "before-withdrawal.sqlite"
+        self.store.backup(backup)
+        self.store.withdraw(self.alice)
+        self.store.withdraw(self.alice, rp=RP)
+        # Simulate a lost Claim Set row while the current decisions survive.
+        with self.store.db:
+            self.store.db.execute("DELETE FROM records")
+        self.reopen_store()
+        self.store.restore(backup)
+
+        self.assertEqual(self.store.load(self.alice), record)
+        before = self.server.collections
+        with self.assertRaisesRegex(ValueError, "collection authorization withdrawn"):
+            self.op.collect("op-alice", "fixture-alice", ["birthdate"])
+        with self.assertRaisesRegex(ValueError, "disclosure authorization withdrawn"):
+            self.op.deliver("op-alice", RP)
+        presentation = self.op.deliver("op-alice", other_rp)
+        response = verify(presentation, (self.op_key.public,), "JWT", OP, other_rp)
+        self.assertEqual(response["_claim_sources"]["cp1"]["JWT"], record.jwt)
+        self.assertEqual(self.server.collections, before)
+
+    def test_cp_token_or_grant_revocation_allows_cached_redisclosure(self):
+        record = self.op.collect("op-alice", "fixture-alice", ["birthdate"])
+        self.reopen_store()
+        remaining_grants = self.server.grants.copy()
+        del remaining_grants["fixture-alice"]
+        cases = (
+            ("token", patch.object(self.server, "grants", remaining_grants), ("fixture-alice",)),
+            ("grant", patch.object(self.server, "revoked_grants", {"grant-alice"}),
+             ("fixture-alice", "fixture-alice-second")),
+        )
+        for kind, cp_state, revoked_tokens in cases:
+            with self.subTest(kind=kind), cp_state:
+                for token in revoked_tokens:
+                    with self.assertRaises(HTTPError) as rejected:
+                        self.op.collect("op-alice", token, ["birthdate"])
+                    with rejected.exception as response:
+                        self.assertEqual(response.code, 401)
+                        self.assertEqual(response.headers["WWW-Authenticate"],
+                                         'Bearer error="invalid_token"')
+                if kind == "token":
+                    self.assertIsNone(self.op.collect("op-alice", "fixture-alice-second", ["address"]))
+                before = self.server.collections
+                self.assertEqual(self.deliver_to_rp()["_claim_sources"]["cp1"]["JWT"], record.jwt)
+                self.assertEqual(self.server.collections, before)
+                self.assertEqual(self.store.load(self.alice), record)
+
+    def test_key_rotation_retains_old_claim_set_only_while_key_is_available(self):
+        old = self.op.collect("op-alice", "fixture-alice", ["birthdate"])
+        self.reopen_store()
+        next_key = KeyPair.generate(self.directory, "cp-next")
+        self.op.cp_keys = (next_key.public, self.cp_key.public)
+
+        with patch.object(self.server, "signing_key", next_key.private):
+            before = self.server.collections
+            old_presentation = self.op.deliver("op-alice", RP)
+            self.assertEqual(receive(old_presentation, self.op_key.public, self.op.cp_keys,
+                                     "op-alice"), {"birthdate": "1990-01-01"})
+
+            self.op.cp_keys = (next_key.public,)
+            with self.assertRaisesRegex(ValueError, "no trusted key"):
+                self.op.deliver("op-alice", RP)
+            with self.assertRaisesRegex(ValueError, "no trusted key"):
+                receive(old_presentation, self.op_key.public, self.op.cp_keys, "op-alice")
+            self.assertEqual(self.server.collections, before)
+            self.assertEqual(self.store.load(self.alice), old)
+
+            new = self.op.collect("op-alice", "fixture-alice", ["birthdate"])
+            self.assertNotEqual(new.jwt, old.jwt)
+            presentation = self.op.deliver("op-alice", RP)
+            self.assertEqual(receive(presentation, self.op_key.public, self.op.cp_keys,
+                                     "op-alice"), {"birthdate": "1990-01-01"})
 
     def collect_with_response(self, make_body, names=("birthdate",)):
         def respond(handler, status, body):
@@ -264,7 +392,7 @@ class CollectionTests(unittest.TestCase):
                     "_claim_sources": {"cp1": {"JWT": jwt}},
                 })
                 with self.assertRaises(ValueError):
-                    receive(presentation, self.op_key.public, self.cp_key.public, "op-alice")
+                    receive(presentation, self.op_key.public, (self.cp_key.public,), "op-alice")
                 self.assert_previous_state(record)
                 self.assertEqual(self.server.collections, before + 1)
 

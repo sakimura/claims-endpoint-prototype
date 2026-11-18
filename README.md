@@ -16,7 +16,7 @@ The CP maps fixture bearer tokens to CP subjects and permitted attributes.
 The OP starts with a fixture for the binding that Setup would establish.
 It obtains the CP response over HTTPS, checks the pending operation and
 account association, verifies the JWT, and retains the exact JWT with
-its binding in trusted in-process memory. The RP function verifies the
+its binding in a local SQLite database. The RP function verifies the
 enclosing OP JWT and the embedded CP JWT before reading the attribute.
 
 The tests cover successful acquisition and delivery, empty results, cached
@@ -30,6 +30,17 @@ The CP distinguishes bearer token and scope errors from a successful empty
 result. The partial-result tests check the actual embedded JWT for attributes
 outside the request or grant and exercise the RP's local required-claim policy.
 
-The fixture supplies authorization and preconfigured issuer keys. Setup,
-OAuth token issuance, discovery, persistent storage, and independent
-implementations are tracked in [Issue #55](https://github.com/openid/claims-aggregation/issues/55).
+The storage tests reopen the database, attempt cross-account record substitution,
+and restore an older Claim Set snapshot. An HMAC authenticates the JWT, account
+binding, and acquisition time. The current deletion and withdrawal decisions
+stay in the active database when restoring a snapshot. The fixture keeps the
+integrity key outside SQLite and the database and snapshots in a private
+temporary directory. The prototype assumes the decisions database is trusted
+and current and does not implement encryption at rest or whole-database rollback
+protection.
+
+The lifecycle tests also exercise redisclosure after CP bearer token or grant
+revocation and verification during and after CP signing-key rotation. They
+use fixture authorization and preconfigured issuer keys. Setup, OAuth token
+issuance, discovery, and independent implementations are tracked in
+[Issue #55](https://github.com/openid/claims-aggregation/issues/55).
